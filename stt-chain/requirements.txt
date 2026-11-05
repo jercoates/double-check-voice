@@ -1,0 +1,7 @@
+# Pinned with hashes: pip refuses anything else (pip install --require-hashes -r requirements.txt).
+# wyoming is MIT licensed and has no runtime dependencies.
+# To upgrade: pick the version, copy both sha256 values from https://pypi.org/project/wyoming/#files,
+# upgrade on a test box first, and re-run the tests.
+wyoming==1.10.2 \
+    --hash=sha256:08aec17ccad4d72fc3f919ab741beacf3f23a1df24c8b9a317ebc6e02d2b227c \
+    --hash=sha256:2a84035d9e51f4be68b27c9791273c5bce29f79f0c37137ea49cc417294f9080

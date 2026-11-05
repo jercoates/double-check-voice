@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>dcv-stt-chain</Name>
+  <Repository>dcv-stt-chain:0.1.0</Repository>
+  <Registry>Build it first: docker build -t dcv-stt-chain:0.1.0 stt-chain/ (a published image is not available yet)</Registry>
+  <Network>host</Network>
+  <Privileged>false</Privileged>
+  <ExtraParams>--user 99:100 --cap-drop ALL --security-opt no-new-privileges --read-only --tmpfs /tmp --memory 512m --pids-limit 128 --log-opt max-size=10m --log-opt max-file=3</ExtraParams>
+  <Overview>Wyoming speech-to-text proxy (double-check-voice). v0.1 is pass-through to faster-whisper with logging of every run. LAN only: Wyoming has no authentication.</Overview>
+  <Category>HomeAutomation:</Category>
+  <Config Name="DCV_LISTEN_URI" Target="DCV_LISTEN_URI" Default="tcp://0.0.0.0:10310" Mode="" Description="Where the proxy listens. Host networking is used so the proxy sees Home Assistant's real IP. Set this to tcp://(this server's LAN IP):10310 so only that address listens. Add it in Home Assistant as a Wyoming engine on that host and port. Each profile needs its own port." Type="Variable" Display="always" Required="true" Mask="false">tcp://0.0.0.0:10310</Config>
+  <Config Name="DCV_WHISPER_URI" Target="DCV_WHISPER_URI" Default="" Mode="" Description="Whisper Wyoming address, e.g. tcp://192.168.1.10:10300" Type="Variable" Display="always" Required="true" Mask="false"></Config>
+  <Config Name="DCV_DEVICE" Target="DCV_DEVICE" Default="default" Mode="" Description="Device or profile name used in logs and audio file names" Type="Variable" Display="always" Required="false" Mask="false">default</Config>
+  <Config Name="DCV_ALLOWED_PEERS" Target="DCV_ALLOWED_PEERS" Default="" Mode="" Description="Home Assistant's IP address (comma-separated for more than one). Required: the proxy refuses to start with this empty, because Wyoming has no authentication. Check the peer field in the logs: it should be HA's own IP, never the Docker gateway." Type="Variable" Display="always" Required="true" Mask="false"></Config>
+  <Config Name="DCV_AUDIO_RETENTION_DAYS" Target="DCV_AUDIO_RETENTION_DAYS" Default="30" Mode="" Description="Days of raw audio to keep" Type="Variable" Display="advanced" Required="false" Mask="false">30</Config>
+  <Config Name="DCV_MODE" Target="DCV_MODE" Default="passthrough" Mode="" Description="passthrough, or compare (also ask Speech-to-Phrase and log both answers; Home Assistant still hears Whisper only). compare needs DCV_PHRASE_URI." Type="Variable" Display="advanced" Required="false" Mask="false">passthrough</Config>
+  <Config Name="DCV_PHRASE_URI" Target="DCV_PHRASE_URI" Default="" Mode="" Description="Speech-to-Phrase Wyoming address, e.g. tcp://192.168.1.40:10301 (enable the app host port first). Only used in compare mode." Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
+  <Config Name="DCV_RUN_LOG_FILE" Target="DCV_RUN_LOG_FILE" Default="1" Mode="" Description="1 = also write each run's log line next to the audio clips (runs_(device).jsonl). Contains transcripts. Set 0 to turn off." Type="Variable" Display="advanced" Required="false" Mask="false">1</Config>
+  <Config Name="Audio" Target="/data/audio" Default="/mnt/user/appdata/dcv-stt-chain/audio" Mode="rw" Description="Raw command audio (WAV), kept for replay" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/dcv-stt-chain/audio</Config>
+</Container>

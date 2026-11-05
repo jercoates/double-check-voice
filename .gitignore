@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.env
+*token*
+*.key
+*.pem
+*.secret*
+.claude/settings.local.json
+# raw household audio never goes in git
+*.wav
+*.flac
+*.mp3
+audio/
+data/
+*.jsonl
+
+# private working notes: kept local, shared with reviewers by hand
+docs/design.md
+CLAUDE.md
