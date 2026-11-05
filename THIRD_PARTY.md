@@ -9,6 +9,7 @@ services below over the network. Licenses were read from each package's publishe
 | Component | Version | License | How it is used |
 |---|---|---|---|
 | [wyoming](https://github.com/OHF-Voice/wyoming) | 1.10.2 | MIT | Python library for the Wyoming protocol; installed from PyPI with pinned hashes |
+| [websockets](https://github.com/python-websockets/websockets) | 17.4 | BSD-3-Clause | Python library used to ask Home Assistant's websocket whether a sentence is a command; pure-Python wheel, pinned with hashes |
 | [Python](https://www.python.org/) (official `python:3.12.16-slim` Docker image) | 3.12.16 | PSF License; the image's Debian base carries its own per-package licenses | Base image, pinned by digest |
 
 ## Used only to run the tests (not shipped)

@@ -445,3 +445,18 @@ async def test_a_non_string_transcript_from_the_second_engine_keeps_the_log_line
     rec = _last_run(capsys)
     assert result.text == "heard 16000"
     assert rec["phrase_text"] == "" and rec["phrase_matched"] is False and rec["agree"] is False
+
+
+def test_dev_requirements_match_the_hashed_runtime_pins():
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+
+    def pins(path):
+        return dict(re.findall(r"^([A-Za-z0-9_.-]+)==(\S+)", path.read_text(), re.M))
+
+    runtime = pins(root / "stt-chain" / "requirements.txt")
+    dev = pins(root / "requirements-dev.txt")
+    assert runtime and all(dev.get(name) == version for name, version in runtime.items())
+    assert "--hash=sha256:" in (root / "stt-chain" / "requirements.txt").read_text()

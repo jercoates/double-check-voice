@@ -57,6 +57,11 @@ deletes) and `config.py` (start-up checks). Useful questions:
 - Tested only with Python 3.12 (the image) and 3.14, with one microphone type, close-up speech and one room.
   Not tested: other VLANs, far-field speech, IPv6 clients, a real Home Assistant on another platform.
 - The Unraid template points at a locally built image; there is no published image yet.
+- The shadow decision's negation check is a word list ("don't", "never", "not", "stop" ...). It also
+  blocks harmless cases ("no problem, turn off the light"), misses "didn't", "isn't" and "doesn't", and
+  "turn on the light, please turn off the fan" is not recognised as two commands. Before the decision is
+  enforced, none of this may be assumed solved, and the exact Whisper text (not the cleaned one in the
+  log) must be what is returned for `whisper` and `whisper_raw`.
 - GitHub Actions are pinned by commit SHA; update them deliberately.
 - On a hung disk, runs whose audio write never finishes leave their pending save (and its audio
   in memory, up to about 1 MB each) until the disk answers. Nothing bounds that count.
@@ -67,6 +72,5 @@ deletes) and `config.py` (start-up checks). Useful questions:
 
 ## Ideas that are planned but not built
 
-Using Speech-to-Phrase's answer when Whisper's text is not actionable, trimming a command out of
-background speech, failover to a second Whisper, per-device profiles, a Home Assistant app, and a
+Acting on the shadow decision (now only logged), failover to a second Whisper, per-device profiles, a Home Assistant app, and a
 second-stage wake word check (`dcv-wake-verify`). If you want to work on one, open an issue first.

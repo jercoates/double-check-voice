@@ -10,6 +10,7 @@ from wyoming.server import AsyncServer
 
 from . import audio_store
 from .config import Config
+from .ha_check import HaChecker, read_token
 from .handler import Shared, SttChainHandler
 
 _LOGGER = logging.getLogger(__name__)
@@ -61,11 +62,25 @@ async def main() -> None:
             "DCV_ALLOW_ANY_PEER is set and DCV_ALLOWED_PEERS is empty: any host that can "
             "reach this port may connect. Set DCV_ALLOWED_PEERS to Home Assistant's IP address"
         )
+    checker = None
+    if cfg.decision != "off":
+        try:
+            token = read_token(cfg.ha_token_file)  # fail at start-up, never echoing the token
+        except ValueError as err:
+            _LOGGER.error("configuration error: DCV_HA_TOKEN_FILE: %s", err)
+            raise SystemExit(2) from None
+        if urlparse(cfg.ha_url).scheme == "ws":
+            _LOGGER.warning(
+                "DCV_HA_URL is ws://: the Home Assistant token is sent unencrypted. Use wss:// "
+                "or keep this link on a network you control"
+            )
+        checker = HaChecker(cfg.ha_url, cfg.ha_token_file, cfg.ha_timeout, token=token)
     audio_store.check_writable(cfg.audio_dir)
     shared = Shared(
         max_connections=cfg.max_connections,
         max_per_ip=cfg.max_per_ip,
         audio_bytes=audio_store.dir_size(cfg.audio_dir),
+        ha=checker,
     )
     purge = asyncio.create_task(_purge_loop(cfg, shared))
     server = AsyncServer.from_uri(cfg.listen_uri)
@@ -79,6 +94,8 @@ async def main() -> None:
         await server.run(partial(SttChainHandler, cfg, shared=shared))
     finally:
         purge.cancel()
+        if checker is not None:
+            await checker.close()
 
 
 if __name__ == "__main__":

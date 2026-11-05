@@ -53,6 +53,27 @@ def _check_tcp_uri(name: str, uri: str) -> None:
         raise ValueError(f"{name} must look like tcp://host:port (got {uri!r})")
 
 
+def _check_ws_uri(name: str, uri: str) -> None:
+    # The value is not echoed back: a pasted address can carry a user name and password.
+    try:
+        parts = urlparse(uri)
+        ok = (
+            parts.scheme in ("ws", "wss")
+            and bool(parts.hostname)
+            and parts.username is None
+            and parts.password is None
+            and not parts.query
+            and not parts.fragment
+        )
+        parts.port  # noqa: B018 - raises ValueError for a bad port
+    except ValueError:
+        ok = False
+    if not ok:
+        raise ValueError(
+            f"{name} must look like ws://host:8123/api/websocket (no user name, password or query)"
+        )
+
+
 @dataclass(frozen=True)
 class Config:
     listen_uri: str
@@ -74,6 +95,10 @@ class Config:
     phrase_uri: str = ""
     phrase_timeout: float = 3.0
     allow_any_peer: bool = False
+    decision: str = "off"
+    ha_url: str = ""
+    ha_token_file: str = ""
+    ha_timeout: float = 1.5
 
     @staticmethod
     def from_env() -> "Config":
@@ -103,7 +128,17 @@ class Config:
             phrase_timeout=_float("DCV_PHRASE_TIMEOUT", 3.0),
             allow_any_peer=os.environ.get("DCV_ALLOW_ANY_PEER", "0").strip().lower()
             in ("1", "true", "yes", "on"),
+            decision=os.environ.get("DCV_DECISION", "off").strip().lower(),
+            ha_url=os.environ.get("DCV_HA_URL", "").strip(),
+            ha_token_file=os.environ.get("DCV_HA_TOKEN_FILE", "").strip(),
+            ha_timeout=_float("DCV_HA_TIMEOUT", 1.5),
         )
+        if cfg.decision not in ("off", "shadow"):
+            raise ValueError("DCV_DECISION must be off or shadow (enforcing is not built yet)")
+        if cfg.decision == "shadow":
+            if not (cfg.ha_url and cfg.ha_token_file):
+                raise ValueError("DCV_DECISION=shadow needs DCV_HA_URL and DCV_HA_TOKEN_FILE")
+            _check_ws_uri("DCV_HA_URL", cfg.ha_url)
         # Wyoming has no authentication, so the safe default is closed: the operator
         # names Home Assistant's address, or says out loud that open access is intended.
         if not cfg.allowed_peers and not cfg.allow_any_peer:
@@ -129,7 +164,10 @@ class Config:
             cfg.max_capture_s,
             cfg.max_connection_s,
             cfg.phrase_timeout,
+            cfg.ha_timeout,
         )
+        if not (0 < cfg.ha_timeout <= 10):
+            raise ValueError("DCV_HA_TIMEOUT must be above 0 and at most 10 seconds")
         if not all(math.isfinite(v) and 0 < v <= 3600 for v in floats):
             raise ValueError(
                 "DCV_*_TIMEOUT, DCV_MAX_CAPTURE_S and DCV_MAX_CONNECTION_S must be > 0 and <= 3600"

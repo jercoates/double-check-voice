@@ -1,4 +1,9 @@
 # Everything needed to run the tests: pip install -r requirements-dev.txt
--r stt-chain/requirements.txt
+#
+# The runtime packages are repeated here WITHOUT hashes on purpose: including
+# stt-chain/requirements.txt (which has hashes) would switch pip into strict hash mode and reject
+# the test tools below. The versions must match stt-chain/requirements.txt; a test checks that.
+wyoming==1.10.2
+websockets==17.4
 pytest==9.2.0
 pytest-asyncio==1.4.1.post1

@@ -33,7 +33,8 @@ to a speech-to-text server. It is meant for a home LAN.
 - The container image runs as a non-root user, the documented run command drops all capabilities
   and uses a read-only filesystem, and the base image and Python packages are pinned by digest and
   hash.
-- No secrets are needed or read by the current version.
+- By default no secrets are needed or read. The optional shadow decision holds one Home Assistant
+  token; see below.
 
 ## Known limits
 
@@ -77,7 +78,31 @@ Assistant, can make Home Assistant receive any command. So:
 - Update the pinned base image now and then (bump the digest in the Dockerfile, then rebuild) to pick up
   security updates; a plain rebuild reuses the same pinned base.
 
-**This project's own credentials.** The current version needs none: it holds no Home Assistant token.
-The planned features that need Home Assistant access (for example checking whether a transcript is a
-command Home Assistant understands) will read their token from a file, never from the command line
-or logs, and are meant to run with a limited user's token, not an administrator's.
+**This project's own credentials.** By default it needs none. With `DCV_DECISION=shadow` it holds a Home
+Assistant long-lived access token, read from a file (never the command line, never logged), and uses it
+only to ask Home Assistant's sentence matcher whether a text is a command; nothing is executed.
+That call does not need an administrator: checked in Home Assistant's source (release 2026.11.0) and by
+testing a non-admin user on a dev instance (the call worked; an admin-only call by the same user was
+refused). Older releases were not checked. Create a separate non-admin user for it and a token for that user.
+
+Be clear about what "non-admin" buys: a token carries its user's rights, and a non-admin user can
+still operate the devices Home Assistant lets that user operate (lights, locks, garage doors) unless
+you restrict it. Long-lived tokens last for years. So a leaked token file is remote control of
+everything that user may operate. To limit that:
+
+- Make the file readable only by the proxy: `chown` it to the user the container runs as (99:100 with
+  the Unraid template's `--user 99:100`; uid 1000 if you pass no `--user`) and `chmod 400` it. Do not make
+  it world-readable to get around a permission error.
+- Keep it out of any folder shared over SMB or NFS, and out of the audio folder.
+- To revoke it, delete the token on that user's profile page in Home Assistant, then replace the file.
+- Only a rejected token is re-read from the file; a replaced file is picked up after the 5-minute pause.
+
+- Over `ws://` the token crosses the network unencrypted. Use `wss://` (the certificate and host name
+  are verified, so use a name that is on the certificate), or keep the link between the proxy and Home
+  Assistant on a network you control. A private certificate authority needs to be in the container's
+  trust store; setting `SSL_CERT_FILE` may work and has not been tested here.
+- The proxy never follows a redirect from the Home Assistant address, and does not send the token to
+  any other host. Compression is off on this connection.
+- A Home Assistant app gets an administrator token from the Supervisor; do not reuse it for this.
+- If you set `login_attempts_threshold` in Home Assistant's `http:` settings, repeated wrong tokens
+  get this host banned. The proxy stops retrying for 5 minutes after a rejection.

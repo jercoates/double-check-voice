@@ -21,6 +21,7 @@ from wyoming.server import AsyncEventHandler
 
 from . import audio_store
 from .config import Config
+from .decide import clean, decide, sentences_to_check
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -122,8 +123,9 @@ class Shared:
     """Process-wide counters: open connections and audio bytes on disk."""
 
     def __init__(
-        self, max_connections: int = 0, max_per_ip: int = 0, audio_bytes: int = 0
+        self, max_connections: int = 0, max_per_ip: int = 0, audio_bytes: int = 0, ha=None
     ) -> None:
+        self.ha = ha  # HaChecker, or None when no decision is configured
         self.max_connections = max_connections
         self.max_per_ip = max_per_ip
         self.active = 0
@@ -579,9 +581,37 @@ class SttChainHandler(AsyncEventHandler):
                     phrase = await asyncio.wait_for(shadow_task, left)
                 except Exception:  # noqa: BLE001
                     phrase = ("", None, "timeout")
-            await self._record(text, upstream_ms, error, saved, phrase)
+            decision = await self._decide(text, phrase)
+            await self._record(text, upstream_ms, error, saved, phrase, decision)
             await self._close_shadow()
             self._reset()
+
+    async def _decide(self, whisper_text: str, phrase: Optional[tuple]) -> Optional[dict]:
+        """Shadow decision: asks Home Assistant what it can act on and logs which text it would
+        have used. Never used for the answer; never raises; bounded by the check's timeout."""
+        checker = self.shared.ha
+        if checker is None or self.cfg.decision == "off":
+            return None
+        try:
+            # Cleaned first (single spaces, bounded length): a crafted transcript must not be
+            # able to make the pattern matching below slow, and the loop must never stall.
+            whisper_text = clean(whisper_text)
+            phrase_text = clean(phrase[0]) if phrase else ""
+            asked = sentences_to_check(whisper_text, phrase_text)
+            t0 = time.monotonic()
+            results = (
+                await asyncio.wait_for(
+                    checker.check(asked, self.language), self.cfg.ha_timeout + 0.5
+                )
+                if asked
+                else []
+            )
+            out = decide(whisper_text, phrase_text, results, asked)
+            out["ha_ms"] = round((time.monotonic() - t0) * 1000)
+            return out
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.error("decision failed: %s", type(err).__name__)
+            return None
 
     @staticmethod
     async def _wait_saved(save_task) -> tuple:
@@ -659,6 +689,7 @@ class SttChainHandler(AsyncEventHandler):
         error: Optional[str],
         saved: Optional[tuple] = None,
         phrase: Optional[tuple] = None,
+        decision: Optional[dict] = None,
     ) -> None:
         """Write the run's log line (saving the audio first if it isn't saved yet)."""
         self.in_run = False
@@ -690,6 +721,8 @@ class SttChainHandler(AsyncEventHandler):
                 record["phrase_error"] = p_err
                 record["latency_ms"]["phrase_after_stop"] = p_ms
                 record["agree"] = bool(_norm(p_text) and _norm(p_text) == _norm(text))
+            if decision is not None:
+                record["decision"] = decision
             log_run(record)
             # Skipped when the audio write already stalled: the disk is the problem,
             # and this connection must not wait on it a second time.

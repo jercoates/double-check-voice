@@ -27,8 +27,8 @@ using your own voice, microphones and rooms, before changing how anything is dec
 | `dcv-stt-chain` compare mode: the same audio also goes to Speech-to-Phrase in the background; both answers are logged; Home Assistant still gets Whisper's | **Works, tested** (shadow only: it never changes the answer) |
 | `tools/replay.py`: replay saved clips through any number of Wyoming engines and compare | **Works, tested** |
 | Audio clean-up presets (`cleanup.py`) | Code and tests exist; **not used by the proxy yet**, only by the replay tool. Early tests showed no benefit on close-up speech from one microphone |
-| Using Speech-to-Phrase's answer when Whisper's text is not something Home Assistant can act on | Planned |
-| Trimming a command out of surrounding background speech | Planned |
+| Deciding which text Home Assistant should get (Whisper's, the command inside it, or Speech-to-Phrase's) from what Home Assistant can act on | **Shadow only**: logged as a `decision`, never used. Tested against a fake Home Assistant and a dev instance; enforcing is not built |
+| Trimming a command out of surrounding background speech | Part of the shadow decision above |
 | Failing over to a second Whisper when the main one is down | Planned |
 | Per-device profiles (one settings file for several microphones) | Planned |
 | `dcv-wake-verify`: a second-stage check that can veto a false wake word | Planned, nothing built |
