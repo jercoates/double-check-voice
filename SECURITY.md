@@ -78,7 +78,7 @@ Assistant, can make Home Assistant receive any command. So:
 - Update the pinned base image now and then (bump the digest in the Dockerfile, then rebuild) to pick up
   security updates; a plain rebuild reuses the same pinned base.
 
-**This project's own credentials.** By default it needs none. With `DCV_DECISION=shadow` it holds a Home
+**This project's own credentials.** By default it needs none. With `DCV_DECISION=shadow` or `enforce` it holds a Home
 Assistant long-lived access token, read from a file (never the command line, never logged), and uses it
 only to ask Home Assistant's sentence matcher whether a text is a command; nothing is executed.
 That call does not need an administrator: checked in Home Assistant's source (release 2026.11.0) and by

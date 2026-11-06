@@ -36,6 +36,7 @@ _ABORT_WAIT_S = 1.0
 _SHADOW_WRITE_S = 0.25  # the shadow engine may never slow the real path
 _SHADOW_MAX_QUEUED = 2048  # events; past this the shadow is given up for the run
 _LANG_RE = re.compile(r"[A-Za-z0-9_-]{1,16}")  # client-chosen: validated before use
+_PHRASE_SKIP_S = 30.0  # enforce stops waiting for a Speech-to-Phrase that just timed out
 _SAVE_WAIT_S = 15.0  # how long a connection waits for the audio write before moving on
 # Run-log writes get their own two threads: a hung share must not starve audio saves.
 _RUNLOG_WAIT_S = 3.0  # short: the file is a convenience, never worth holding a slot
@@ -126,6 +127,9 @@ class Shared:
         self, max_connections: int = 0, max_per_ip: int = 0, audio_bytes: int = 0, ha=None
     ) -> None:
         self.ha = ha  # HaChecker, or None when no decision is configured
+        # After Speech-to-Phrase times out or can't be reached, enforce stops waiting for it for a
+        # while: a wedged or slow add-on must not add its wait to every unusable utterance.
+        self.phrase_skip_until = 0.0
         self.max_connections = max_connections
         self.max_per_ip = max_per_ip
         self.active = 0
@@ -136,18 +140,24 @@ class Shared:
         self.purge_lock = asyncio.Lock()
 
 
-async def close_client(client: Optional[AsyncClient]) -> None:
-    """Close an upstream client without ever waiting on a peer that stopped reading."""
+async def close_client(client: Optional[AsyncClient], abort: bool = True) -> None:
+    """Close an upstream client without ever waiting on a peer that stopped reading.
+
+    `abort=False` lets bytes already written reach the peer first (an abort can discard them).
+    """
     if client is None:
         return
     writer = getattr(client, "_writer", None)
     transport = getattr(writer, "transport", None)
-    if transport is not None:
+    if abort and transport is not None:
         transport.abort()  # drop unsent bytes now; wait_closed() can otherwise hang
     try:
         await asyncio.wait_for(client.disconnect(), _ABORT_WAIT_S)
     except Exception:  # noqa: BLE001
-        pass
+        # A peer that is not reading never lets a polite close finish: drop the socket and its
+        # buffered bytes now instead of leaving them open for as long as the peer stays wedged.
+        if not abort and transport is not None:
+            transport.abort()
 
 
 class SttChainHandler(AsyncEventHandler):
@@ -174,6 +184,7 @@ class SttChainHandler(AsyncEventHandler):
         self.shadow_queue: Optional[asyncio.Queue] = None  # compare mode only
         self.shadow_task: Optional[asyncio.Future] = None
         self.shadow_dead = False
+        self.shadow_overflow = False  # the shadow was given up on: no stop marker will ever come
 
     # ---- connection loop -------------------------------------------------
 
@@ -314,6 +325,7 @@ class SttChainHandler(AsyncEventHandler):
             return  # an empty chunk carries nothing for the shadow
         if self.shadow_queue.qsize() >= _SHADOW_MAX_QUEUED:
             self.shadow_dead = True  # a flood the shadow can't drain: drop it, Whisper carries on
+            self.shadow_overflow = True
             return
         self.shadow_queue.put_nowait(event)
 
@@ -341,6 +353,8 @@ class SttChainHandler(AsyncEventHandler):
         client = None
         stage = "connect"
         text, ms, error = "", None, None
+        told_to_stop = False
+        started = False  # an AudioStart has been written: only then is there a decoder to end
         try:
             client = AsyncClient.from_uri(self.cfg.phrase_uri)
             await asyncio.wait_for(client.connect(), self.cfg.connect_timeout)
@@ -351,7 +365,9 @@ class SttChainHandler(AsyncEventHandler):
                     t_stop = item
                     break
                 await asyncio.wait_for(client.write_event(item), _SHADOW_WRITE_S)
+                started = started or AudioStart.is_type(item.type)
             deadline = t_stop + self.cfg.phrase_timeout
+            stage = "stop"
             await asyncio.wait_for(
                 client.write_event(AudioStop().event()), max(0.1, deadline - loop.time())
             )
@@ -374,13 +390,21 @@ class SttChainHandler(AsyncEventHandler):
         except asyncio.TimeoutError:
             error = "timeout" if stage == "read" else f"{stage}: timeout"
         except asyncio.CancelledError:
+            if stage == "send" and started and client is not None:
+                # Speech-to-Phrase starts a decoder at audio-start and only ends it at audio-stop;
+                # leaving without one strands that process (and the model it holds) on its host.
+                try:
+                    await asyncio.wait_for(client.write_event(AudioStop().event()), 0.2)
+                    told_to_stop = True
+                except Exception:  # noqa: BLE001
+                    pass
             raise
         except Exception as err:  # noqa: BLE001
             error = f"{stage}: {type(err).__name__}"
         finally:
             if self.shadow_queue is queue:  # not a newer run's queue, if this task ran late
                 self.shadow_dead = True  # stop queueing; nothing reads the queue any more
-            await close_client(client)
+            await close_client(client, abort=not told_to_stop)
         return text, ms, error
 
     async def _send_upstream(self, event: Event) -> None:
@@ -536,6 +560,7 @@ class SttChainHandler(AsyncEventHandler):
         self._shadow_stop(t_stop)
         shadow_task = self.shadow_task
         phrase = None
+        decision = None
         try:
             if self.upstream is not None:
                 try:
@@ -564,27 +589,136 @@ class SttChainHandler(AsyncEventHandler):
                     error = f"read: {type(err).__name__}"
             await self._close_upstream()
 
+            answer = text
+            if self.cfg.decision == "enforce" and self.shared.ha is not None:
+                answer, phrase, decision = await self._gate(text, shadow_task, t_stop)
+
             # Always answer HA, even if empty: never hang the pipeline.
             try:
                 await asyncio.wait_for(
-                    self.write_event(Transcript(text=text, language=self.language).event()),
+                    self.write_event(Transcript(text=answer, language=self.language).event()),
                     self.cfg.connect_timeout,
                 )
             except Exception as err:  # noqa: BLE001
                 error = f"{error + '; ' if error else ''}answer: {type(err).__name__}"
         finally:
             saved = await self._wait_saved(save_task)
-            if shadow_task is not None:
-                # Held at most until just past the shadow's own deadline, counted from the stop.
-                left = max(0.1, t_stop + self.cfg.phrase_timeout + 0.5 - loop.time())
-                try:
-                    phrase = await asyncio.wait_for(shadow_task, left)
-                except Exception:  # noqa: BLE001
-                    phrase = ("", None, "timeout")
-            decision = await self._decide(text, phrase)
-            await self._record(text, upstream_ms, error, saved, phrase, decision)
+            if self.cfg.decision == "enforce" and self.shared.ha is not None:
+                # The gate already decided (and answered). A fast pass leaves Speech-to-Phrase
+                # unfinished: it is cancelled below, and the log says it was not needed.
+                if phrase is None and shadow_task is not None:
+                    phrase = self._unwaited_phrase(shadow_task, decision)
+            else:
+                if shadow_task is not None:
+                    # Held at most until just past the shadow's own deadline, counted from the stop.
+                    left = max(0.1, t_stop + self.cfg.phrase_timeout + 0.5 - loop.time())
+                    try:
+                        phrase = await asyncio.wait_for(shadow_task, left)
+                    except Exception:  # noqa: BLE001
+                        phrase = ("", None, "timeout")
+                decision = await self._decide(text, phrase)
+            await self._record(text, upstream_ms, error, saved, phrase, decision, answer)
             await self._close_shadow()
             self._reset()
+
+    async def _gate(self, text: str, shadow_task, t_stop: float) -> tuple:
+        """Enforce: pick the text HA gets. Returns (answer, phrase result or None, decision).
+
+        Fast pass: if Whisper's text (or a command inside it) is something Home Assistant can act
+        on, it is answered at once and Speech-to-Phrase is not waited for. Only otherwise does it
+        wait, within Speech-to-Phrase's own deadline, for the text that has been running alongside
+        Whisper since the audio began. Any failure answers Whisper's text unchanged.
+        Never raises; the whole gate is bounded.
+        """
+        loop = asyncio.get_running_loop()
+        floor = self.cfg.ha_timeout + 0.5
+        # One deadline counted from the end of the audio, with room for at least one check even when
+        # Whisper itself was slow: first check, the wait for Speech-to-Phrase, second check.
+        budget = max(floor, t_stop + self.cfg.phrase_timeout + 2 * floor - loop.time())
+        state: dict = {"deadline": loop.time() + budget}
+        try:
+            return await asyncio.wait_for(self._gate_inner(text, shadow_task, t_stop, state), budget)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.error("gate failed: %s", type(err).__name__)
+            # Keep what was learned before the failure: HA was reachable if the first check worked.
+            return text, state.get("phrase"), state.get("out") or self._raw(text, enforced=True)
+
+    @staticmethod
+    def _raw(text: str, enforced: bool = False) -> dict:
+        return {
+            "use": "whisper_raw",
+            "text": clean(text),
+            "ha": {"available": False, "whisper": None, "phrase": None, "intent": None},
+            "enforced": enforced,
+        }
+
+    async def _ask(self, asked: list) -> Optional[list]:
+        if not asked:
+            return []
+        return await asyncio.wait_for(
+            self.shared.ha.check(asked, self.language), self.cfg.ha_timeout + 0.5
+        )
+
+    async def _wait_phrase(self, shadow_task, t_stop: float) -> tuple:
+        """Speech-to-Phrase's result, waited for only up to its own deadline, and not at all when it
+        was given up on or has just been timing out."""
+        loop = asyncio.get_running_loop()
+        if self.shadow_overflow and not shadow_task.done():
+            return ("", None, "dropped")  # its queue overflowed: it can never finish
+        if not shadow_task.done() and loop.time() < self.shared.phrase_skip_until:
+            return ("", None, "skipped_slow")
+        left = max(0.1, t_stop + self.cfg.phrase_timeout + 0.2 - loop.time())
+        try:
+            phrase = await asyncio.wait_for(asyncio.shield(shadow_task), left)
+        except Exception:  # noqa: BLE001
+            phrase = ("", None, "timeout")
+        err = phrase[2]
+        if err and ("timeout" in err or err.startswith(("connect", "send"))):
+            self.shared.phrase_skip_until = loop.time() + _PHRASE_SKIP_S
+        return phrase
+
+    @staticmethod
+    def _unwaited_phrase(shadow_task, decision: Optional[dict]) -> tuple:
+        """What to log for Speech-to-Phrase when the gate answered without waiting for it."""
+        if shadow_task.done() and not shadow_task.cancelled() and shadow_task.exception() is None:
+            return shadow_task.result()  # it had already answered: keep its text for the replay
+        if decision is not None and not decision["ha"]["available"]:
+            return ("", None, "skipped_ha_down")
+        return ("", None, "not_needed")
+
+    async def _gate_inner(self, text: str, shadow_task, t_stop: float, state: dict) -> tuple:
+        t0 = time.monotonic()
+        whisper = clean(text)
+        asked = sentences_to_check(whisper, "")
+        results = await self._ask(asked)
+        if results is None:
+            # Home Assistant can't be asked: today's behavior, without waiting for anyone.
+            return text, None, self._raw(text, enforced=True)
+        out = decide(whisper, "", results, asked)
+        out["enforced"] = True
+        state["out"] = out
+        phrase = None
+        if out["use"] == "whisper_raw" and shadow_task is not None:
+            state["phrase"] = ("", None, "timeout")  # what the log says if the deadline cuts the wait
+            phrase = await self._wait_phrase(shadow_task, t_stop)
+            state["phrase"] = phrase
+            phrase_text = clean(phrase[0])
+            more = [s for s in sentences_to_check("", phrase_text) if s not in asked] if phrase_text else []
+            # Not enough time left for a whole check: skip it rather than have the deadline cancel
+            # one mid-call, which would pause the checks for every room.
+            checked = False
+            if more and state["deadline"] - asyncio.get_running_loop().time() >= self.cfg.ha_timeout + 0.1:
+                extra = await self._ask(more)
+                if extra is not None:
+                    out = decide(whisper, phrase_text, results + extra, asked + more)
+                    checked = True
+            if phrase_text and phrase_text not in asked and not checked:
+                out["ha"]["phrase_checked"] = False  # Speech-to-Phrase said something we never checked
+                state["out"] = out
+        out["enforced"] = True
+        out["ha_ms"] = round((time.monotonic() - t0) * 1000)
+        # Whisper's own words go back exactly as it said them; only a swap uses cleaned text.
+        return (text if out["use"] in ("whisper", "whisper_raw") else out["text"]), phrase, out
 
     async def _decide(self, whisper_text: str, phrase: Optional[tuple]) -> Optional[dict]:
         """Shadow decision: asks Home Assistant what it can act on and logs which text it would
@@ -690,6 +824,7 @@ class SttChainHandler(AsyncEventHandler):
         saved: Optional[tuple] = None,
         phrase: Optional[tuple] = None,
         decision: Optional[dict] = None,
+        answer: Optional[str] = None,
     ) -> None:
         """Write the run's log line (saving the audio first if it isn't saved yet)."""
         self.in_run = False
@@ -723,6 +858,11 @@ class SttChainHandler(AsyncEventHandler):
                 record["agree"] = bool(_norm(p_text) and _norm(p_text) == _norm(text))
             if decision is not None:
                 record["decision"] = decision
+                if decision.get("enforced"):
+                    # What Home Assistant actually received, and which text that was.
+                    record["answer"] = answer
+                    record["used"] = {"whisper": "whisper", "whisper_trimmed": "whisper_trimmed",
+                                      "phrase": "phrase"}.get(decision["use"], "whisper" if text else "none")
             log_run(record)
             # Skipped when the audio write already stalled: the disk is the problem,
             # and this connection must not wait on it a second time.

@@ -24,10 +24,10 @@ using your own voice, microphones and rooms, before changing how anything is dec
 | Part | State |
 |---|---|
 | `dcv-stt-chain`: Wyoming proxy to faster-whisper, raw audio saved, one JSON log line per command | **Works, tested** |
-| `dcv-stt-chain` compare mode: the same audio also goes to Speech-to-Phrase in the background; both answers are logged; Home Assistant still gets Whisper's | **Works, tested** (shadow only: it never changes the answer) |
+| `dcv-stt-chain` compare mode: the same audio also goes to Speech-to-Phrase in the background; both answers are logged; Home Assistant still gets Whisper's | **Works, tested** (it changes the answer only with `DCV_DECISION=enforce`) |
 | `tools/replay.py`: replay saved clips through any number of Wyoming engines and compare | **Works, tested** |
 | Audio clean-up presets (`cleanup.py`) | Code and tests exist; **not used by the proxy yet**, only by the replay tool. Early tests showed no benefit on close-up speech from one microphone |
-| Deciding which text Home Assistant should get (Whisper's, the command inside it, or Speech-to-Phrase's) from what Home Assistant can act on | **Shadow only**: logged as a `decision`, never used. Tested against a fake Home Assistant and a dev instance; enforcing is not built |
+| Deciding which text Home Assistant should get (Whisper's, the command inside it, or Speech-to-Phrase's) from what Home Assistant can act on | Logged by default (`shadow`). `DCV_DECISION=enforce` acts on it; off by default, new, tested only against a fake Home Assistant and a dev instance |
 | Trimming a command out of surrounding background speech | Part of the shadow decision above |
 | Failing over to a second Whisper when the main one is down | Planned |
 | Per-device profiles (one settings file for several microphones) | Planned |

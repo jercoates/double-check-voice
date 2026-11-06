@@ -57,11 +57,20 @@ deletes) and `config.py` (start-up checks). Useful questions:
 - Tested only with Python 3.12 (the image) and 3.14, with one microphone type, close-up speech and one room.
   Not tested: other VLANs, far-field speech, IPv6 clients, a real Home Assistant on another platform.
 - The Unraid template points at a locally built image; there is no published image yet.
-- The shadow decision's negation check is a word list ("don't", "never", "not", "stop" ...). It also
-  blocks harmless cases ("no problem, turn off the light"), misses "didn't", "isn't" and "doesn't", and
-  "turn on the light, please turn off the fan" is not recognised as two commands. Before the decision is
-  enforced, none of this may be assumed solved, and the exact Whisper text (not the cleaned one in the
-  log) must be what is returned for `whisper` and `whisper_raw`.
+- The decision's negation check is a word list ("don't", "didn't", "never", "not", "stop" ...). It also
+  blocks harmless cases ("no problem, turn off the light"), and "turn on the light, please turn off the
+  fan" is not recognised as two commands. `enforce` is new: run `shadow` first and read the logs. Home
+  Assistant's debug call skips a newer fallback matcher, so it can call a sentence unusable that the
+  real pipeline would have accepted; the proxy then falls to Speech-to-Phrase's text only if that passes.
+- Speech-to-Phrase 1.4.3 (read in source, not profiled) starts a Kaldi decoder at audio-start, keeps one
+  warm spare after every command, has no CPU or thread setting and does not reap a decoder when a client
+  leaves early. The proxy always sends it an audio-stop before closing, except in two rare races: a
+  cancel while the audio-start itself is still being written, and a cancel during the final stop write.
+  Each can strand one decoder on that host.
+- A gate cut off while it waits for Speech-to-Phrase does not start the 30 s skip window, so the next
+  room may wait the same time again.
+- `enforce` has been run against real Whisper, Speech-to-Phrase and a dev Home Assistant on 33 clips
+  only; the Speech-to-Phrase wait was too slow on that laptop to measure much. Run `shadow` first.
 - GitHub Actions are pinned by commit SHA; update them deliberately.
 - On a hung disk, runs whose audio write never finishes leave their pending save (and its audio
   in memory, up to about 1 MB each) until the disk answers. Nothing bounds that count.
@@ -72,5 +81,5 @@ deletes) and `config.py` (start-up checks). Useful questions:
 
 ## Ideas that are planned but not built
 
-Acting on the shadow decision (now only logged), failover to a second Whisper, per-device profiles, a Home Assistant app, and a
+Failover to a second Whisper, per-device profiles, a Home Assistant app, and a
 second-stage wake word check (`dcv-wake-verify`). If you want to work on one, open an issue first.

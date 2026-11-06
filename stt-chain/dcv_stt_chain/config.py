@@ -133,11 +133,13 @@ class Config:
             ha_token_file=os.environ.get("DCV_HA_TOKEN_FILE", "").strip(),
             ha_timeout=_float("DCV_HA_TIMEOUT", 1.5),
         )
-        if cfg.decision not in ("off", "shadow"):
-            raise ValueError("DCV_DECISION must be off or shadow (enforcing is not built yet)")
-        if cfg.decision == "shadow":
+        if cfg.decision not in ("off", "shadow", "enforce"):
+            raise ValueError("DCV_DECISION must be off, shadow or enforce")
+        if cfg.decision in ("shadow", "enforce"):
             if not (cfg.ha_url and cfg.ha_token_file):
-                raise ValueError("DCV_DECISION=shadow needs DCV_HA_URL and DCV_HA_TOKEN_FILE")
+                raise ValueError(
+                    f"DCV_DECISION={cfg.decision} needs DCV_HA_URL and DCV_HA_TOKEN_FILE"
+                )
             _check_ws_uri("DCV_HA_URL", cfg.ha_url)
         # Wyoming has no authentication, so the safe default is closed: the operator
         # names Home Assistant's address, or says out loud that open access is intended.

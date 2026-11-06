@@ -27,10 +27,10 @@ returning only Whisper's. `fallback` and `phrase_only` come after the logs justi
 | `DCV_MAX_PER_IP` | `8` | Same, per client IP. Home Assistant is one IP for every satellite, so keep this above the number of rooms that can talk at once |
 | `DCV_MAX_CONNECTION_S` | `120.0` s | A connection is closed after this long, however busy. Home Assistant opens one per command, so this only stops a client holding a slot |
 | `DCV_RUN_LOG_FILE` | `1` | Also write each run's log line to `<audio folder>/<day>/runs_<device>.jsonl`, next to that day's clips (mode 0640, removed with the audio by `DCV_AUDIO_RETENTION_DAYS`). It contains transcripts of what was said in the house, so it is in any backup or share of the appdata folder. Runs with no audio are not written; each file stops growing at 20 MB (stdout still logs). The run-log files are NOT counted in `DCV_AUDIO_MAX_MB` (only age removes them), so budget up to 20 MB per device per day on top of it. Temporary data gathering: `0` turns it off. If the write fails the run still completes. Log lines are ASCII-only (non-ASCII is escaped)
-| `DCV_MODE` | `passthrough` | `passthrough` or `compare`. In `compare` the proxy also streams the same audio to Speech-to-Phrase and logs both transcripts; Home Assistant still gets Whisper's answer only (shadow mode: it decides nothing). `compare` needs `DCV_PHRASE_URI` |
+| `DCV_MODE` | `passthrough` | `passthrough` or `compare`. In `compare` the proxy also streams the same audio to Speech-to-Phrase and logs both transcripts; Home Assistant still gets Whisper's answer unless `DCV_DECISION=enforce`. `compare` needs `DCV_PHRASE_URI` |
 | `DCV_PHRASE_URI` | empty | Speech-to-Phrase's Wyoming address, e.g. `tcp://192.168.1.40:10301` (the app's host port is off by default; enable it on the app's Network page) |
-| `DCV_PHRASE_TIMEOUT` | `3.0` s | How long, from the end of the audio, the proxy waits for Speech-to-Phrase. Its run log line is written after this wait, so the connection is held up to that long (plus 0.5 s) after HA has its answer |
-| `DCV_DECISION` | `off` | `off` or `shadow`. In `shadow` the proxy asks Home Assistant, after the answer has gone out, which of the candidate texts it could act on, and logs the `decision` it *would* have made. Home Assistant still gets Whisper's text. Needs the three settings below |
+| `DCV_PHRASE_TIMEOUT` | `3.0` s | How long, from the end of the audio, the proxy waits for Speech-to-Phrase. Without `enforce` the run log line is written after this wait, so the connection is held up to that long (plus 0.5 s) after HA has its answer. With `enforce` it is the longest a command Whisper got wrong can be held for Speech-to-Phrase |
+| `DCV_DECISION` | `off` | `off`, `shadow` or `enforce`. In `shadow` the proxy asks Home Assistant, after the answer has gone out, which of the candidate texts it could act on, and logs the `decision` it *would* have made; Home Assistant still gets Whisper's text. In `enforce` Home Assistant gets the text the decision picks (see below). Both need the three settings below. Run `shadow` first |
 | `DCV_HA_URL` | empty | Home Assistant's websocket address, e.g. `ws://192.168.1.30:8123/api/websocket`. `ws://` sends the token unencrypted (the proxy warns); use `wss://` or a network you control |
 | `DCV_HA_TOKEN_FILE` | empty | Path of a file holding a Home Assistant long-lived access token (plain ASCII, one token). Read at start-up, and again only after Home Assistant rejects it; never logged, never taken from the command line. **Use a token of a non-admin user**: the call the proxy makes does not need admin rights (read from Home Assistant's source, release 2026.11.0, and tested with a non-admin user on a dev instance). See SECURITY.md for how to protect the file |
 | `DCV_HA_TIMEOUT` | `1.5` s | Time allowed for each Home Assistant check (above 0, at most 10). After a failure the proxy stops asking for 5 s, doubling to 60 s, once per outage however many runs hit it; a rejected token is not retried for 5 minutes. An error reply to one request does not start a pause. Over-long or idle connections to Home Assistant are reopened once automatically |
@@ -82,12 +82,42 @@ if it names a device or area, resolved it to at least one device that is exposed
 Home Assistant reports a match for a name it knows even when that device is not exposed, with no
 target; the proxy does not count that.
 
-Nothing here changes what Home Assistant receives: this version only logs. The check runs after
-Home Assistant has its answer, so it never delays it, but it keeps the connection open for up to
-`DCV_HA_TIMEOUT` + 0.5 s more, after any wait for Speech-to-Phrase.
+In `shadow` nothing here changes what Home Assistant receives. The check runs after Home Assistant
+has its answer, so it never delays it, but it keeps the connection open for up to `DCV_HA_TIMEOUT` +
+0.5 s more, after any wait for Speech-to-Phrase.
+
+### Enforcing
+
+With `DCV_DECISION=enforce` the answer waits for the check, in this order:
+
+1. The audio goes to Whisper and to Speech-to-Phrase (compare mode) at the same time, as it arrives.
+2. When Whisper finishes, its text and the commands inside it are checked at once (about 40 ms on a warm connection; the first check after a start also connects and logs in).
+3. If Whisper's text is actionable, or a command inside it is, that is the answer. Speech-to-Phrase is
+   **not** waited for; its run is cancelled once the answer is sent and the run logged (the log shows
+   `phrase_error: not_needed`).
+4. Only otherwise does the proxy wait for Speech-to-Phrase, at most until `DCV_PHRASE_TIMEOUT` after
+   the end of the audio, and checks its text. If that is actionable it is the answer, unless Whisper
+   heard a negation ("don't", "not", "never" ...) that Speech-to-Phrase's text lacks: its grammar can
+   only say commands, so the swap could do the opposite of what was said. Then Whisper's text goes back.
+   After Speech-to-Phrase times out or can't be reached, the proxy stops waiting for it for 30 s.
+5. If nothing is actionable, or Home Assistant can't be asked, Whisper's text goes back exactly as
+   Whisper said it, and nothing waits for Speech-to-Phrase when Home Assistant can't be asked.
+
+When Whisper returns nothing (or is down) and Speech-to-Phrase has a good command, that command is
+the answer. The cost: a command Whisper gets wrong waits for Speech-to-Phrase (up to
+`DCV_PHRASE_TIMEOUT`); a command Whisper gets right does not wait for anything but the check. The
+whole step is bounded (at most `DCV_PHRASE_TIMEOUT` + two Home Assistant checks after the end of the audio, 7 s with the
+defaults; or 2 s after Whisper answers, if that is later. Whisper itself is limited by
+`DCV_RESULT_TIMEOUT`. A check is skipped, not cut short, when too little of that time is left), and any
+failure inside it returns Whisper's text.
+
+In `enforce` the log line gains `answer` (what Home Assistant received) and `used` says which engine it
+came from (`whisper`, `whisper_trimmed`, `phrase`, `none`). `phrase_error` says why Speech-to-Phrase's
+result is missing: `not_needed` (fast pass), `skipped_ha_down`, `skipped_slow`, `dropped` (its audio
+queue overflowed) or `timeout`. If Speech-to-Phrase had already answered, its text is kept.
 
 Limits, on purpose: transcripts are cut to 2000 characters and cleaned to single spaces first (the
-`text` in the decision is that cleaned text, not necessarily the exact words Home Assistant got); a
+`text` in the decision is that cleaned text; in `enforce` Whisper's own text is returned untouched); a
 text longer than 512 characters is not sent to Home Assistant (its sentences are); at most 6
 sentences are examined; a sentence cut out at the word "turn" is not used when what comes before it
 is a negation ("don't turn off ...") or ends in "and", "or", "then", "but", "also" or "plus", because the second
@@ -106,7 +136,7 @@ half alone would mean something else.
 | A LAN host holds connections open | Capped per IP, in total and by connection lifetime. There is no authentication, so keep the port off untrusted networks |
 | Speech-to-Phrase down, slow, hung or dropping (compare mode) | Nothing changes for HA: it gets Whisper's answer on time. The log line shows `phrase_error` (`connect: ...`, `timeout`, `closed`, `error`) and `phrase_matched: false`. The shadow runs in its own task, so it cannot block the Whisper path |
 | Whisper or Speech-to-Phrase sends a reply over the size limits (64 KB of header data, 64 KB payload; 1 MB for the describe reply) | Treated as an error: HA gets an empty transcript, the run is logged with `read: ProtocolError`, and nothing is buffered past the limit |
-| Home Assistant down, slow, refusing the token or sending nonsense (`DCV_DECISION=shadow`) | The decision is logged as `whisper_raw` with `ha.available: false`. Home Assistant's answer is unaffected |
+| Home Assistant down, slow, refusing the token or sending nonsense (`DCV_DECISION=shadow` or `enforce`) | The decision is logged as `whisper_raw` with `ha.available: false`. Home Assistant gets Whisper's text, as without the proxy's decision, and in `enforce` nothing waits for Speech-to-Phrase |
 | Unsupported audio format | Empty transcript, connection closed |
 | Malformed or oversized message | Nothing is read past the limits (header data 16 KB, audio chunk 64 KB). If a command was open, it is answered with what was heard so far; then the connection is closed |
 | Proxy down | HA shows the engine unavailable. Keep a second pipeline on plain Whisper as the fallback |

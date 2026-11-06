@@ -13,8 +13,8 @@ from dcv_stt_chain.config import Config
 from dcv_stt_chain.decide import decide, pieces, sentences_to_check
 from dcv_stt_chain.ha_check import HaChecker
 from dcv_stt_chain.handler import Shared, SttChainHandler
-from test_passthrough import FakeWhisper, make_cfg, run_command, start
-from test_robustness import _last_run, _phrase_cls
+from test_passthrough import FakeWhisper, free_port, make_cfg, run_command, start
+from test_robustness import FakePhrase, _last_run, _phrase_cls
 
 TOKEN = "t0ken-for-tests-only"
 
@@ -53,6 +53,9 @@ class FakeHa:
                 continue
             if self.mode.get("big"):
                 await ws.send("x" * (ha_check.MAX_MESSAGE_BYTES + 10))
+                continue
+            if self.mode.get("junk_after") and replies > self.mode["junk_after"]:
+                await ws.send(json.dumps({"id": msg["id"], "type": "result", "success": True, "result": {"results": 5}}))
                 continue
             if self.mode.get("junk"):
                 await ws.send(json.dumps({"id": msg["id"], "type": "result", "success": True, "result": {"results": 5}}))
@@ -269,7 +272,8 @@ async def _run(tmp_path, token_file, ha_mode=None, phrase=None, whisper_text=Non
         pserver, pport = await start(lambda r, w: phrase(r, w))
         extra = dict(mode="compare", phrase_uri=f"tcp://127.0.0.1:{pport}")
     cfg = make_cfg(
-        tmp_path, wport, decision="shadow", ha_url=ha.url, ha_token_file=token_file, ha_timeout=1.0, **extra, **over
+        tmp_path, wport, ha_url=ha.url, ha_token_file=token_file, ha_timeout=1.0,
+        **{"decision": "shadow", **extra, **over},
     )
     checker = HaChecker(ha.url, token_file, 1.0)
     proxy, pport2 = await start(partial(SttChainHandler, cfg, shared=Shared(ha=checker)))
@@ -342,8 +346,11 @@ async def test_no_decision_without_configuration(tmp_path, capsys):
 
 def test_decision_settings_are_validated(monkeypatch, tmp_path):
     monkeypatch.setenv("DCV_WHISPER_URI", "tcp://x:1")
-    monkeypatch.setenv("DCV_DECISION", "enforce")
+    monkeypatch.setenv("DCV_DECISION", "maybe")
     with pytest.raises(ValueError, match="DCV_DECISION"):
+        Config.from_env()
+    monkeypatch.setenv("DCV_DECISION", "enforce")
+    with pytest.raises(ValueError, match="DCV_HA_URL"):  # acting needs the check, same as shadow
         Config.from_env()
     monkeypatch.setenv("DCV_DECISION", "shadow")
     with pytest.raises(ValueError, match="DCV_HA_URL"):
@@ -677,3 +684,517 @@ async def test_cancelling_a_check_mid_call_starts_the_pause_but_cancelling_a_wai
         await checker.close()
     finally:
         await ha.stop()
+
+
+# ---- enforcing: the fast pass and the fallback --------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_enforce_fast_pass_answers_without_waiting_for_speech_to_phrase(tmp_path, token_file, capsys):
+    hang = _phrase_cls(hang=True)
+    result, took, ha = await _run(
+        tmp_path, token_file, phrase=hang, whisper_text="Turn  the kitchen light off.", decision="enforce"
+    )
+    rec = _last_run(capsys)
+    assert result.text == "Turn  the kitchen light off."  # Whisper's exact words, not the cleaned copy
+    assert took < 1.0  # phrase_timeout is 3 s: it was not waited for
+    d = rec["decision"]
+    assert d["use"] == "whisper" and d["enforced"] is True
+    assert rec["phrase_error"] == "not_needed"
+    assert all("turn on the light" not in (x or []) for x in ha.sentences_seen)  # never asked about it
+
+
+@pytest.mark.asyncio
+async def test_enforce_sends_the_audio_to_both_engines_while_it_is_still_arriving(tmp_path, token_file, capsys):
+    from wyoming.asr import Transcribe
+    from wyoming.audio import AudioChunk, AudioStart, AudioStop
+    from wyoming.client import AsyncClient
+
+    class W(FakeWhisper):
+        got = 0
+
+        async def handle_event(self, event):
+            if AudioChunk.is_type(event.type):
+                type(self).got += len(event.payload or b"")
+            return await super().handle_event(event)
+
+    P = _phrase_cls(text="turn the kitchen light off")
+    ha = await FakeHa().start()
+    whisper, wport = await start(lambda r, w: W(r, w))
+    pserver, pport = await start(lambda r, w: P(r, w))
+    cfg = make_cfg(
+        tmp_path, wport, decision="enforce", ha_url=ha.url, ha_token_file=token_file, ha_timeout=1.0,
+        mode="compare", phrase_uri=f"tcp://127.0.0.1:{pport}",
+    )
+    checker = HaChecker(ha.url, token_file, 1.0)
+    proxy, port = await start(partial(SttChainHandler, cfg, shared=Shared(ha=checker)))
+    client = AsyncClient.from_uri(f"tcp://127.0.0.1:{port}")
+    try:
+        await client.connect()
+        await client.write_event(Transcribe(language="en").event())
+        await client.write_event(AudioStart(rate=16000, width=2, channels=1).event())
+        await client.write_event(AudioChunk(rate=16000, width=2, channels=1, audio=b"\x01\x00" * 1600).event())
+        await asyncio.sleep(0.5)  # the command is still being spoken: no AudioStop yet
+        assert W.got == 3200 and P.heard == 3200  # both engines already have the audio so far
+        await client.write_event(AudioStop().event())
+        await asyncio.wait_for(client.read_event(), 5)
+    finally:
+        await client.disconnect()
+        await proxy.stop()
+        await whisper.stop()
+        await pserver.stop()
+        await checker.close()
+        await ha.stop()
+
+
+@pytest.mark.asyncio
+async def test_enforce_trimmed_command_is_answered_without_waiting_for_speech_to_phrase(tmp_path, token_file, capsys):
+    result, took, _ = await _run(
+        tmp_path, token_file, phrase=_phrase_cls(hang=True),
+        whisper_text="I hate this. Turn the kitchen light off. Why?", decision="enforce",
+    )
+    assert result.text == "Turn the kitchen light off." and took < 1.0
+    assert _last_run(capsys)["decision"]["use"] == "whisper_trimmed"
+
+
+@pytest.mark.asyncio
+async def test_enforce_falls_to_speech_to_phrase_when_whisper_is_not_actionable(tmp_path, token_file, capsys):
+    result, _, _ = await _run(
+        tmp_path, token_file, phrase=_phrase_cls(text="turn the kitchen light off"),
+        whisper_text="Turn the kitchen lid off.", decision="enforce",
+    )
+    rec = _last_run(capsys)
+    assert result.text == "turn the kitchen light off"
+    assert rec["decision"]["use"] == "phrase" and rec["decision"]["enforced"] is True
+    assert rec["whisper_text"] == "Turn the kitchen lid off."  # the log still has what Whisper said
+
+
+@pytest.mark.asyncio
+async def test_enforce_uses_speech_to_phrase_when_whisper_heard_nothing(tmp_path, token_file, capsys):
+    result, _, _ = await _run(
+        tmp_path, token_file, phrase=_phrase_cls(text="turn the kitchen light off"),
+        whisper_text="", decision="enforce",
+    )
+    assert result.text == "turn the kitchen light off"
+
+
+@pytest.mark.asyncio
+async def test_enforce_neither_actionable_answers_whispers_exact_text(tmp_path, token_file, capsys):
+    result, _, _ = await _run(
+        tmp_path, token_file, phrase=_phrase_cls(text="blah blah"),
+        whisper_text="Turn  the kitchen lid off.", decision="enforce",
+    )
+    assert result.text == "Turn  the kitchen lid off."
+    assert _last_run(capsys)["decision"]["use"] == "whisper_raw"
+
+
+@pytest.mark.asyncio
+async def test_enforce_slow_speech_to_phrase_is_waited_for_only_up_to_its_own_limit(tmp_path, token_file, capsys):
+    result, took, _ = await _run(
+        tmp_path, token_file, phrase=_phrase_cls(hang=True),
+        whisper_text="Turn the kitchen lid off.", decision="enforce", phrase_timeout=0.5,
+    )
+    assert result.text == "Turn the kitchen lid off." and took < 2.0
+    assert _last_run(capsys)["phrase_error"] == "timeout"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [{"junk": True}, {"refuse": True}, {"slow": 3}, {"auth_bad": True}])
+async def test_enforce_with_home_assistant_unreachable_answers_whisper_without_waiting(tmp_path, token_file, capsys, mode):
+    result, took, _ = await _run(
+        tmp_path, token_file, ha_mode=mode, phrase=_phrase_cls(hang=True),
+        whisper_text="Turn the kitchen lid off.", decision="enforce",
+    )
+    assert result.text == "Turn the kitchen lid off." and took < 1.8  # not held for Speech-to-Phrase
+    assert _last_run(capsys)["decision"]["ha"]["available"] is False
+
+
+@pytest.mark.asyncio
+async def test_enforce_without_speech_to_phrase_still_passes_a_good_command(tmp_path, token_file, capsys):
+    result, _, _ = await _run(
+        tmp_path, token_file, whisper_text="Turn the kitchen light off.", decision="enforce"
+    )
+    assert result.text == "Turn the kitchen light off."
+
+
+def test_negations_stop_a_command_being_cut_out_of_a_refusal():
+    from dcv_stt_chain.decide import split
+
+    for refusal in ("I didn't mean it", "that isn't right", "she doesn't want it", "we cant", "it wasnt"):
+        parts = split(f"{refusal} turn off the kitchen light")
+        assert parts[-1][0].lower().startswith("turn") and parts[-1][1] is False, refusal
+    parts = split("okay turn off the kitchen light")
+    assert parts[-1][1] is True  # nothing negative before it
+
+
+# ---- review fixes for the gate --------------------------------------------------------
+
+
+def test_speech_to_phrase_cannot_overturn_a_negated_command():
+    ask = ["don't turn off the kitchen light", "turn off the kitchen light"]
+    res = _results(ask, {"turn off the kitchen light"})
+    out = decide("don't turn off the kitchen light", "turn off the kitchen light", res, ask)
+    assert out["use"] == "whisper_raw"  # the swap would do the opposite of what was said
+    # a negation Speech-to-Phrase also heard is no reason to refuse it
+    ask = ["do not turn off the kitchen light", "do not turn off the kitchen light now"]
+    res = _results(ask, {"do not turn off the kitchen light now"})
+    assert decide(ask[0], ask[1], res, ask)["use"] == "phrase"
+
+
+@pytest.mark.asyncio
+async def test_enforce_logs_what_was_sent_and_which_engine_it_came_from(tmp_path, token_file, capsys):
+    result, _, _ = await _run(
+        tmp_path, token_file, phrase=_phrase_cls(text="turn the kitchen light off"),
+        whisper_text="", decision="enforce",
+    )
+    rec = _last_run(capsys)
+    assert result.text == "turn the kitchen light off"
+    assert rec["used"] == "phrase" and rec["answer"] == "turn the kitchen light off"
+    assert rec["whisper_text"] == ""
+
+
+@pytest.mark.asyncio
+async def test_enforce_keeps_speech_to_phrases_text_in_the_log_when_it_answered_first(tmp_path, token_file, capsys):
+    class SlowWhisper(FakeWhisper):
+        async def handle_event(self, event):
+            from wyoming.asr import Transcript
+            from wyoming.audio import AudioStop
+
+            if AudioStop.is_type(event.type):
+                await asyncio.sleep(0.4)  # Speech-to-Phrase is done long before this
+                await self.write_event(Transcript(text="Turn the kitchen light off.").event())
+                return True
+            return await super().handle_event(event)
+
+    ha = await FakeHa().start()
+    whisper, wport = await start(lambda r, w: SlowWhisper(r, w))
+    pserver, pport = await start(lambda r, w: _phrase_cls(text="blah")(r, w))
+    cfg = make_cfg(
+        tmp_path, wport, decision="enforce", ha_url=ha.url, ha_token_file=token_file, ha_timeout=1.0,
+        mode="compare", phrase_uri=f"tcp://127.0.0.1:{pport}",
+    )
+    checker = HaChecker(ha.url, token_file, 1.0)
+    proxy, port = await start(partial(SttChainHandler, cfg, shared=Shared(ha=checker)))
+    try:
+        result = await run_command(port)
+    finally:
+        await proxy.stop()
+        await whisper.stop()
+        await pserver.stop()
+        await checker.close()
+        await ha.stop()
+    rec = _last_run(capsys)
+    assert result.text == "Turn the kitchen light off."
+    assert rec["phrase_text"] == "blah" and rec["phrase_error"] is None  # kept for the replay
+
+
+@pytest.mark.asyncio
+async def test_enforce_does_not_wait_for_a_shadow_that_was_given_up_on(tmp_path, token_file, capsys, monkeypatch):
+    from dcv_stt_chain import handler as handler_mod
+
+    monkeypatch.setattr(handler_mod, "_SHADOW_MAX_QUEUED", 1)  # the queue overflows at once
+    result, took, _ = await _run(
+        tmp_path, token_file, phrase=_phrase_cls(hang=True),
+        whisper_text="Turn the kitchen lid off.", decision="enforce",
+    )
+    assert result.text == "Turn the kitchen lid off." and took < 1.5  # phrase_timeout is 3 s
+    assert _last_run(capsys)["phrase_error"] == "dropped"
+
+
+@pytest.mark.asyncio
+async def test_enforce_stops_waiting_for_a_speech_to_phrase_that_just_timed_out(tmp_path, token_file, capsys):
+    ha = await FakeHa().start()
+    whisper, wport = await start(lambda r, w: FakeWhisper(r, w))
+
+    class W(FakeWhisper):
+        async def handle_event(self, event):
+            from wyoming.asr import Transcript
+            from wyoming.audio import AudioStop
+
+            if AudioStop.is_type(event.type):
+                await self.write_event(Transcript(text="Turn the kitchen lid off.").event())
+                return True
+            return await super().handle_event(event)
+
+    await whisper.stop()
+    whisper, wport = await start(lambda r, w: W(r, w))
+    pserver, pport = await start(lambda r, w: _phrase_cls(hang=True)(r, w))
+    cfg = make_cfg(
+        tmp_path, wport, decision="enforce", ha_url=ha.url, ha_token_file=token_file, ha_timeout=1.0,
+        mode="compare", phrase_uri=f"tcp://127.0.0.1:{pport}", phrase_timeout=0.6,
+    )
+    checker = HaChecker(ha.url, token_file, 1.0)
+    proxy, port = await start(partial(SttChainHandler, cfg, shared=Shared(ha=checker)))
+    try:
+        t0 = time.monotonic()
+        await run_command(port)
+        first = time.monotonic() - t0
+        rec1 = _last_run(capsys)
+        t0 = time.monotonic()
+        await run_command(port)
+        second = time.monotonic() - t0
+        rec2 = _last_run(capsys)
+    finally:
+        await proxy.stop()
+        await whisper.stop()
+        await pserver.stop()
+        await checker.close()
+        await ha.stop()
+    assert rec1["phrase_error"] == "timeout" and first > 0.5
+    assert rec2["phrase_error"] == "skipped_slow" and second < first  # not held again
+
+
+@pytest.mark.asyncio
+async def test_enforce_second_home_assistant_check_failing_answers_whispers_text(tmp_path, token_file, capsys):
+    # The first check (Whisper's text) works and finds nothing; the second (Speech-to-Phrase's) gets junk.
+    result, _, _ = await _run(
+        tmp_path, token_file, ha_mode={"junk_after": 1}, phrase=_phrase_cls(text="turn the kitchen light off"),
+        whisper_text="Turn the kitchen lid off.", decision="enforce",
+    )
+    assert result.text == "Turn the kitchen lid off."
+    assert _last_run(capsys)["decision"]["use"] == "whisper_raw"
+
+
+@pytest.mark.asyncio
+async def test_enforce_whisper_error_with_speech_to_phrase_answering(tmp_path, token_file, capsys):
+    ha = await FakeHa().start()
+    port = free_port()  # nothing listens: Whisper is down
+    pserver, pport = await start(lambda r, w: _phrase_cls(text="turn the kitchen light off")(r, w))
+    cfg = make_cfg(
+        tmp_path, port, decision="enforce", ha_url=ha.url, ha_token_file=token_file, ha_timeout=1.0,
+        mode="compare", phrase_uri=f"tcp://127.0.0.1:{pport}",
+    )
+    checker = HaChecker(ha.url, token_file, 1.0)
+    proxy, pp = await start(partial(SttChainHandler, cfg, shared=Shared(ha=checker)))
+    try:
+        result = await run_command(pp)
+    finally:
+        await proxy.stop()
+        await pserver.stop()
+        await checker.close()
+        await ha.stop()
+    rec = _last_run(capsys)
+    assert result.text == "turn the kitchen light off"  # Whisper down: Speech-to-Phrase carries it
+    assert rec["error"] and rec["decision"]["use"] == "phrase"
+
+
+@pytest.mark.asyncio
+async def test_enforce_two_rooms_at_once_get_their_own_answers(tmp_path, token_file, capsys):
+    ha = await FakeHa(slow=0.3).start()
+    texts = iter(["Turn the kitchen light off.", "Turn the kitchen lid off."])
+
+    class W(FakeWhisper):
+        async def handle_event(self, event):
+            from wyoming.asr import Transcript
+            from wyoming.audio import AudioStop
+
+            if AudioStop.is_type(event.type):
+                await self.write_event(Transcript(text=next(texts)).event())
+                return True
+            return await super().handle_event(event)
+
+    whisper, wport = await start(lambda r, w: W(r, w))
+    pserver, pport = await start(lambda r, w: _phrase_cls(text="turn the kitchen light on")(r, w))
+    cfg = make_cfg(
+        tmp_path, wport, decision="enforce", ha_url=ha.url, ha_token_file=token_file, ha_timeout=2.0,
+        mode="compare", phrase_uri=f"tcp://127.0.0.1:{pport}",
+    )
+    checker = HaChecker(ha.url, token_file, 2.0)
+    proxy, port = await start(partial(SttChainHandler, cfg, shared=Shared(ha=checker)))
+    try:
+        a, b = await asyncio.gather(run_command(port), run_command(port))
+    finally:
+        await proxy.stop()
+        await whisper.stop()
+        await pserver.stop()
+        await checker.close()
+        await ha.stop()
+    assert sorted([a.text, b.text]) == sorted(["Turn the kitchen light off.", "turn the kitchen light on"])
+
+
+@pytest.mark.asyncio
+async def test_enforce_skips_a_check_it_has_no_time_for_instead_of_pausing_every_room(tmp_path, token_file, capsys):
+    from wyoming.asr import Transcript
+    from wyoming.audio import AudioStop
+
+    class SlowWhisper(FakeWhisper):
+        async def handle_event(self, event):
+            if AudioStop.is_type(event.type):
+                await asyncio.sleep(2.5)  # a busy GPU: the gate's budget is down to its floor
+                await self.write_event(Transcript(text="Turn the kitchen lid off.").event())
+                return True
+            return await super().handle_event(event)
+
+    ha = await FakeHa(slow=0.8).start()
+    whisper, wport = await start(lambda r, w: SlowWhisper(r, w))
+    pserver, pport = await start(lambda r, w: _phrase_cls(text="turn the kitchen light off")(r, w))
+    cfg = make_cfg(
+        tmp_path, wport, decision="enforce", ha_url=ha.url, ha_token_file=token_file, ha_timeout=1.0,
+        mode="compare", phrase_uri=f"tcp://127.0.0.1:{pport}", phrase_timeout=0.2, result_timeout=5.0,
+    )
+    checker = HaChecker(ha.url, token_file, 1.0)
+    proxy, port = await start(partial(SttChainHandler, cfg, shared=Shared(ha=checker)))
+    try:
+        result = await run_command(port)
+        paused = checker._down_until
+    finally:
+        await proxy.stop()
+        await whisper.stop()
+        await pserver.stop()
+        await checker.close()
+        await ha.stop()
+    rec = _last_run(capsys)
+    assert result.text == "Turn the kitchen lid off."  # no time left to check Speech-to-Phrase's text
+    assert paused == 0.0  # and the checks for the other rooms were not paused
+    assert rec["decision"]["ha"]["available"] is True and rec["decision"]["use"] == "whisper_raw"
+
+
+def test_stop_is_a_command_not_a_reversal_when_deciding_whether_a_swap_overturns():
+    from dcv_stt_chain.decide import overturns
+
+    assert not overturns("stop the musik", "pause the music")
+    assert overturns("don't pause the music", "pause the music")
+    assert overturns("never mind turn it off", "turn it off")
+
+
+@pytest.mark.asyncio
+async def test_a_client_leaving_mid_command_still_ends_speech_to_phrases_audio(tmp_path):
+    from wyoming.asr import Transcribe
+    from wyoming.audio import AudioChunk, AudioStart, AudioStop
+    from wyoming.client import AsyncClient
+
+    stops = []
+
+    class P(FakePhrase):
+        async def handle_event(self, event):
+            if AudioStop.is_type(event.type):
+                stops.append(1)
+            return await super().handle_event(event)
+
+    whisper, wport = await start(lambda r, w: FakeWhisper(r, w))
+    pserver, pport = await start(lambda r, w: P(r, w))
+    cfg = make_cfg(tmp_path, wport, mode="compare", phrase_uri=f"tcp://127.0.0.1:{pport}")
+    proxy, port = await start(partial(SttChainHandler, cfg))
+    client = AsyncClient.from_uri(f"tcp://127.0.0.1:{port}")
+    try:
+        await client.connect()
+        await client.write_event(Transcribe(language="en").event())
+        await client.write_event(AudioStart(rate=16000, width=2, channels=1).event())
+        await client.write_event(AudioChunk(rate=16000, width=2, channels=1, audio=bytes(3200)).event())
+        await asyncio.sleep(0.3)
+        await client.disconnect()  # no AudioStop: the command is abandoned
+        await asyncio.sleep(0.8)
+    finally:
+        await proxy.stop()
+        await whisper.stop()
+        await pserver.stop()
+    assert stops == [1]  # Speech-to-Phrase was told the audio ended, so it can finish and free its decoder
+
+
+@pytest.mark.asyncio
+async def test_a_polite_close_that_never_finishes_is_aborted_not_left_open():
+    from dcv_stt_chain.handler import close_client
+
+    class Transport:
+        aborted = False
+
+        def abort(self):
+            self.aborted = True
+
+    class Writer:
+        transport = Transport()
+
+    class Stuck:
+        _writer = Writer()
+
+        async def disconnect(self):
+            await asyncio.sleep(30)  # a peer that is not reading: the polite close never completes
+
+    client = Stuck()
+    t0 = time.monotonic()
+    await close_client(client, abort=False)
+    assert client._writer.transport.aborted and time.monotonic() - t0 < 2.0
+
+
+@pytest.mark.asyncio
+async def test_leaving_before_audio_start_does_not_send_speech_to_phrase_a_lone_stop(tmp_path):
+    from wyoming.asr import Transcribe
+    from wyoming.audio import AudioStop
+    from wyoming.client import AsyncClient
+
+    stops = []
+
+    class P(FakePhrase):
+        async def handle_event(self, event):
+            if AudioStop.is_type(event.type):
+                stops.append(1)
+            return await super().handle_event(event)
+
+    whisper, wport = await start(lambda r, w: FakeWhisper(r, w))
+    pserver, pport = await start(lambda r, w: P(r, w))
+    cfg = make_cfg(tmp_path, wport, mode="compare", phrase_uri=f"tcp://127.0.0.1:{pport}")
+    proxy, port = await start(partial(SttChainHandler, cfg))
+    client = AsyncClient.from_uri(f"tcp://127.0.0.1:{port}")
+    try:
+        await client.connect()
+        await client.write_event(Transcribe(language="en").event())
+        await asyncio.sleep(0.3)
+        await client.disconnect()  # Transcribe only: no AudioStart was ever sent
+        await asyncio.sleep(0.8)
+    finally:
+        await proxy.stop()
+        await whisper.stop()
+        await pserver.stop()
+    assert stops == []
+
+
+@pytest.mark.asyncio
+async def test_enforce_marks_a_speech_to_phrase_text_it_never_checked(tmp_path, token_file, capsys):
+    # same set-up as the no-time-for-a-check test: the second check is skipped, and the log says so
+    from wyoming.asr import Transcript
+    from wyoming.audio import AudioStop
+
+    class SlowWhisper(FakeWhisper):
+        async def handle_event(self, event):
+            if AudioStop.is_type(event.type):
+                await asyncio.sleep(2.5)
+                await self.write_event(Transcript(text="Turn the kitchen lid off.").event())
+                return True
+            return await super().handle_event(event)
+
+    ha = await FakeHa(slow=0.8).start()
+    whisper, wport = await start(lambda r, w: SlowWhisper(r, w))
+    pserver, pport = await start(lambda r, w: _phrase_cls(text="turn the kitchen light off")(r, w))
+    cfg = make_cfg(
+        tmp_path, wport, decision="enforce", ha_url=ha.url, ha_token_file=token_file, ha_timeout=1.0,
+        mode="compare", phrase_uri=f"tcp://127.0.0.1:{pport}", phrase_timeout=0.2, result_timeout=5.0,
+    )
+    checker = HaChecker(ha.url, token_file, 1.0)
+    proxy, port = await start(partial(SttChainHandler, cfg, shared=Shared(ha=checker)))
+    try:
+        await run_command(port)
+    finally:
+        await proxy.stop()
+        await whisper.stop()
+        await pserver.stop()
+        await checker.close()
+        await ha.stop()
+    rec = _last_run(capsys)
+    assert rec["phrase_text"] == "turn the kitchen light off"
+    assert rec["decision"]["ha"]["phrase_checked"] is False
+
+
+def test_cannot_and_shant_count_as_reversals():
+    from dcv_stt_chain.decide import overturns
+
+    assert overturns("you cannot turn it off", "turn it off")
+    assert overturns("you shan't turn it off", "turn it off")
+    assert overturns("he mightn't turn it off", "turn it off")
+
+
+def test_a_command_is_not_cut_out_after_cannot_shant_or_mightnt():
+    from dcv_stt_chain.decide import split
+
+    for refusal in ("you cannot", "she shan't", "he mightn't"):
+        parts = split(f"{refusal} turn off the kitchen light")
+        assert parts[-1][0].lower().startswith("turn") and parts[-1][1] is False, refusal

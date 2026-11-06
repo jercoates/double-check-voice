@@ -2,8 +2,8 @@
 
 The rule (Jeremy's): Whisper's text wins if Home Assistant can act on it; failing that, the
 command sentence found inside Whisper's text; failing that, Speech-to-Phrase's text; and if
-none of them is actionable, Whisper's text exactly as before. This module only decides. In
-this version the decision is logged, never used (shadow mode).
+none of them is actionable, Whisper's text exactly as before. This module only decides; the
+handler logs the decision (shadow) or acts on it (enforce).
 
 Everything here works on text that has been through clean(): single spaces and a length cap,
 so no pattern below can be made slow by a crafted transcript.
@@ -20,7 +20,13 @@ MAX_PIECE_CHARS = 200
 _STRONG = re.compile(r"(?<=[.?!])\s+")  # a full stop, question or exclamation mark
 _WEAK = re.compile(r"\s(?=turn\s)", re.IGNORECASE)  # "... on turn the kitchen light off" run together
 _NEGATION = re.compile(
-    r"\b(?:don'?t|do not|never|not|no|stop|cancel|without|can'?t|won'?t|shouldn'?t|wouldn'?t)\b"
+    r"\b(?:do not|cannot|never|not|no|nor|neither|nothing|nobody|stop|cancel|without|shan'?t|mightn'?t"
+    r"|(?:do|did|is|does|are|was|were|have|has|had|could|should|would|must|need|ca|wo|ai)n'?t)\b"
+)
+# For refusing a swap: only words that reverse a command. "stop" and "cancel" are commands themselves.
+_REVERSAL = re.compile(
+    r"\b(?:do not|cannot|never|not|no|nor|neither|nothing|nobody|without|shan'?t|mightn'?t"
+    r"|(?:do|did|is|does|are|was|were|have|has|had|could|should|would|must|need|ca|wo|ai)n'?t)\b"
 )
 _CONJUNCTION = re.compile(r"\b(?:and|or|then|but|also|plus)\s*$")
 
@@ -83,6 +89,17 @@ def sentences_to_check(whisper: str, phrase: str) -> list:
     return ordered
 
 
+def _negated(text: str) -> bool:
+    return bool(_REVERSAL.search(text.lower().replace("\u2019", "'")))
+
+
+def overturns(whisper: str, phrase: str) -> bool:
+    """Speech-to-Phrase's grammar can only say commands, so it may drop a "don't": when Whisper
+    heard a negation and Speech-to-Phrase's text has none, the swap would do the opposite of
+    what was said, so it is refused."""
+    return _negated(whisper) and not _negated(phrase)
+
+
 def decide(whisper: str, phrase: str, results: Optional[list], asked: Optional[list] = None) -> dict:
     """`results` is HaChecker.check's answer for `asked` (default sentences_to_check), or None."""
     if results is None:
@@ -105,7 +122,7 @@ def decide(whisper: str, phrase: str, results: Optional[list], asked: Optional[l
         trimmed = next((p for p, promotable in split(whisper) if promotable and p != whisper and ok(p)), None)
         if trimmed is not None:
             use, text = "whisper_trimmed", trimmed
-        elif ok(phrase):
+        elif ok(phrase) and not overturns(whisper, phrase):
             use, text = "phrase", phrase
         else:
             use, text = "whisper_raw", whisper
